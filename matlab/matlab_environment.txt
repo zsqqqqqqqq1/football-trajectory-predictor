@@ -1,0 +1,5 @@
+MATLAB 26.1.0.3203278 (R2026a)
+Input: E:\学校项目\国际大学生物理竞赛2026\football-trajectory-predictor-spin\matlab\..\results\matlab_cases.json
+Solver: ode113
+MaxStep: 0.01 s
+Ground: descending z-R event; initial upward launch advanced 1e-8 s before activating events.

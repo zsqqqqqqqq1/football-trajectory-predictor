@@ -20,7 +20,7 @@ def main():
         ('gaussian', 'wide', 4000, 1500),
         ('gaussian', 'strong', 4000, 1500),
         ('rounding', 'wide', 4000, 1500),
-        ('rounding', 'strong', 12000, 2500),
+        ('rounding', 'strong', 4000, 1500),
     )
     jobs = [(noise, prior, draws, burn, 20261107 + index, str(output))
             for index, (noise, prior, draws, burn) in enumerate(settings)]

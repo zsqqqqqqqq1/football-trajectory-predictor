@@ -25,7 +25,7 @@ from pathlib import Path
 
 import numpy as np
 
-from model import Physics, fit, propagate
+from model import Physics, drag_coefficient, fit, propagate
 from ekf import ekf_predict
 from validate import region_metrics, wilson
 
@@ -215,16 +215,16 @@ def score_method(method, case, sigma, seed):
     target, ref = case["target_x"], case["reference"]
     if method == "gravity":
         f = fit(r0, times, obs, model="gravity", regularize=False)
-        e = propagate(f["theta"], r0, f["B"], target_x=target)
+        e = propagate(f["theta"], r0, fixed_cd=f["fixed_cd"], target_x=target)
         point = np.array([e["tg"], e["yg"], e["zg"]])
         return dict(status=e["status"], point=point, cd=0.0, coverage=None, area=None)
     if method == "batch":
         f = fit(r0, times, obs, noise="gaussian", sigma=sigma)
-        e = propagate(f["theta"], r0, f["B"], target_x=target)
+        e = propagate(f["theta"], r0, fixed_cd=f["fixed_cd"], target_x=target)
         return dict(status=e["status"], point=np.array([e["tg"], e["yg"], e["zg"]]),
-                    cd=float(f["theta"][3]), coverage=None, area=None)
+                    cd=drag_coefficient(np.linalg.norm(f["theta"][:3])), coverage=None, area=None)
     if method == "ekf":
-        res = ekf_predict(r0, times, obs, noise_sd=sigma, n_filters=512, draws=400, seed=seed,
+        res = ekf_predict(r0, times, obs, noise_sd=sigma, draws=4000, seed=seed,
                           target_x=target)
         metrics = region_metrics(res["predictions"], ref)
         crossed = np.all(np.isfinite(res["predictions"]), axis=1)

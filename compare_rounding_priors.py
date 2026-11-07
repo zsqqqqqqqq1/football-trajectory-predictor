@@ -53,11 +53,12 @@ def evaluate(case, prior, draws):
     try:
         result = sample_posterior(case['r0'], case['times'], obs, noise='rounding',
                                   prior=prior, draws=draws, burn=1500, seed=13041 + shot)
-        events = [propagate(theta, case['r0'], result['fit']['B']) for theta in result['samples']]
+        events = [propagate(theta, case['r0']) for theta in result['samples']]
         pred = np.array([[e['tg'], e['yg'], e['zg']] for e in events])
         summary, grid = summarize(pred, [e['status'] for e in events])
         diagnostics = result['diagnostics']
-        row.update(p_cross=summary['p_cross'], max_rhat=max(diagnostics['split_rhat']),
+        max_rhat = max(diagnostics['split_rhat'])
+        row.update(p_cross=summary['p_cross'], max_rhat=max_rhat if np.isfinite(max_rhat) else None,
                    min_ess=min(diagnostics['ess']), reliable=diagnostics['reliable'])
         if grid is not None:
             truth = np.array(case['reference'][1:])
@@ -110,8 +111,8 @@ def main():
     parser.add_argument('--retry-failed', action='store_true',
                         help='Repeat both priors for incomplete or unreliable pairs only')
     args = parser.parse_args()
-    if args.draws < 4 or args.draws % 4 or args.workers < 1:
-        parser.error('--draws must be a positive multiple of 4, and --workers must be positive')
+    if args.draws < 20 or args.draws % 4 or args.workers < 1:
+        parser.error('--draws must be a multiple of 4 (at least 20), and --workers must be positive')
     cases, fingerprint = read_cases()
     OUTPUT.mkdir(parents=True, exist_ok=True)
     checkpoint = OUTPUT / 'checkpoint.json'
