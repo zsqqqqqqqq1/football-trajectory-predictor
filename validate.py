@@ -1,8 +1,7 @@
 """Reproducible synthetic hold-out benchmark; no training on later positions.
 
-Batch uncertainty here is explicitly a truncated local Laplace approximation,
-not the main-case MCMC result. EKF uncertainty uses a discrete aerodynamic prior
-mixture. Regions are empirical 95% covariance ellipses, conditional on crossing.
+Batch uncertainty here uses a truncated local Laplace approximation.
+The EKF uses a single nine-dimensional Gaussian state. Regions are empirical 95% covariance ellipses, conditional on crossing.
 """
 from __future__ import annotations
 
@@ -14,8 +13,8 @@ from pathlib import Path
 import numpy as np
 from scipy.integrate import solve_ivp
 
-from model import Physics, basis_from_observations, fit, prior_spec, propagate
-from ekf import ekf_predict, _prior_arrays
+from model import Physics, drag_coefficient, fit, propagate
+from ekf import ekf_predict
 
 
 def region_metrics(predictions, truth):
@@ -51,7 +50,7 @@ def batch_laplace(r0, times, obs, draws, seed, prior='wide', target_x=11.):
     covariance = np.linalg.pinv(jac.T @ jac, rcond=1e-12)
     eigval, eigvec = np.linalg.eigh(covariance)
     transform = eigvec @ np.diag(np.sqrt(np.maximum(eigval, 0)))
-    _, _, lo, hi = _prior_arrays(prior)
+    lo, hi = solution['prior']['lo'], solution['prior']['hi']
     rng = np.random.default_rng(seed)
     accepted, attempted = [], 0
     while len(accepted) < draws and attempted < draws * 500:
@@ -63,47 +62,43 @@ def batch_laplace(r0, times, obs, draws, seed, prior='wide', target_x=11.):
         raise RuntimeError('Insufficient bounded Laplace samples.')
     predictions = []
     for sample in accepted[:draws]:
-        result = propagate(sample, r0, solution['B'], target_x=target_x)
+        result = propagate(sample, r0, target_x=target_x)
         predictions.append([result.get(k, np.nan) for k in ('tg', 'yg', 'zg')])
     return np.asarray(predictions), solution
 
 
 def make_truth(theta, times, scenario, r0, physics):
     """Independent generator; scenarios are intentionally absent from inversion."""
-    direction_obs = np.outer(times, theta[:3]) + r0
-    bmat = basis_from_observations(r0, direction_obs)
-    k = physics.rho * np.pi * physics.R**2 / (2 * physics.m)
-    def integrate(basis):
-        base_b = basis @ theta[4:]
-        def rhs(t, state):
-            cd = theta[3] * (1 + .6 * t / .4) if scenario == 'variable_cd' else theta[3]
-            wind = np.array([0., 4., 0.]) if scenario == 'crosswind' else np.zeros(3)
-            b = base_b + basis @ (np.array([.22, -.18]) * np.sin(2 * np.pi * t / .4)) if scenario == 'time_varying_b' else base_b
-            u = state[3:] - wind
-            acc = np.array([0., 0., -physics.g]) + k * np.linalg.norm(u) * (-cd * u + np.cross(b, u))
-            return np.r_[state[3:], acc]
-        def goal(t, state):
-            return state[0] - 11
-        goal.terminal, goal.direction = True, 1
-        def ground(t, state):
-            return state[2] - physics.R
-        ground.terminal, ground.direction = True, -1
-        return solve_ivp(rhs, [0., 3.], np.r_[r0, theta[:3]], dense_output=True,
-                         events=[goal, ground], rtol=2e-10, atol=1e-12, max_step=.01)
-    # Solve the reference-plane convention to convergence using clean early data.
-    for _ in range(12):
-        result = integrate(bmat)
-        observations = result.sol(times)[:3].T
-        revised = basis_from_observations(r0, observations)
-        difference = np.max(np.abs(revised - bmat))
-        bmat = revised
-        if difference < 1e-12:
-            break
-    result = integrate(bmat)
-    if not len(result.t_events[0]):
+    wind = np.array([0., 4., 0.]) if scenario == 'crosswind' else np.zeros(3)
+    decay = 1.2 if scenario == 'fast_spin_decay' else physics.spin_decay
+
+    def flight(t, state):
+        u = state[3:6] - wind
+        speed = np.linalg.norm(u)
+        cd = drag_coefficient(speed, physics.drag_profile)
+        if scenario == 'higher_drag':
+            cd *= 1.3
+        spin = theta[3:] * np.exp(-decay * t)
+        acceleration = (np.array([0., 0., -physics.g]) - physics.drag_factor * cd * speed * u
+                        + physics.magnus * np.cross(spin, u))
+        return np.r_[state[3:6], acceleration]
+
+    def goal(t, state):
+        return state[0] - 11
+
+    def ground(t, state):
+        return state[2] - physics.R
+
+    goal.terminal, goal.direction = True, 1
+    ground.terminal, ground.direction = True, -1
+    result = solve_ivp(flight, (0., 3.), np.r_[r0, theta[:3]], dense_output=True,
+                       events=[goal, ground], rtol=2e-10, atol=1e-12, max_step=.01)
+    if not result.success:
+        raise RuntimeError(result.message)
+    if not len(result.t_events[0]) or result.t_events[0][0] <= times[-1]:
         return None
     crossing = np.r_[result.t_events[0][0], result.y_events[0][0, 1:3]]
-    return result.sol(times)[:3].T, crossing, bmat
+    return result.sol(times)[:3].T, crossing
 
 
 def wilson(successes, total):
@@ -116,16 +111,16 @@ def wilson(successes, total):
     return [float(center-half), float(center+half)]
 
 
-def run_benchmark(output, shots=12, draws=240, filters=512, seed=20261107):
+def run_benchmark(output, shots=12, draws=4000, seed=20261107):
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(seed)
     physics, r0 = Physics(), np.array([0., 0., .11])
-    scenarios = ['same_model', 'variable_cd', 'crosswind', 'time_varying_b']
+    scenarios = ['same_model', 'higher_drag', 'crosswind', 'fast_spin_decay']
     rows, generated, rejected = [], [], []
     for shot in range(shots):
         theta = np.r_[rng.uniform(27, 34), rng.uniform(-6, 6), rng.uniform(5, 9),
-                      rng.uniform(.17, .38), rng.uniform(-.12, .12, 2)]
+                      rng.uniform(-25., 25., 3)]
         times = np.array([.05, .10])
         noise = rng.normal(0, .01, (2, 3))
         for scenario in scenarios:
@@ -133,38 +128,33 @@ def run_benchmark(output, shots=12, draws=240, filters=512, seed=20261107):
             if truth is None:
                 rejected.append({'shot': shot, 'scenario': scenario, 'reason': 'ground_before_goal'})
                 continue
-            clean, reference, bmat = truth
+            clean, reference = truth
             obs = clean + noise
             generated.append(dict(shot=shot, scenario=scenario, theta=theta.tolist(),
                                   r0=r0.tolist(), times=times.tolist(), observations=obs.tolist(),
-                                  clean_observations=clean.tolist(), reference=reference.tolist(),
-                                  B=bmat.tolist()))
+                                  clean_observations=clean.tolist(), reference=reference.tolist()))
             shared_seed = seed + shot * 100 + scenarios.index(scenario)
-            for method in ['batch_laplace', 'ekf_mixture']:
+            for method in ['batch_laplace', 'ekf_9d']:
                 try:
                     if method == 'batch_laplace':
                         predictions, fitted = batch_laplace(r0, times, obs, draws, shared_seed)
-                        ess = None
                     else:
-                        result = ekf_predict(r0, times, obs, draws=draws, n_filters=filters,
-                                             seed=shared_seed)
+                        result = ekf_predict(r0, times, obs, draws=draws, seed=shared_seed)
                         predictions = result['predictions']
-                        ess = result['diagnostics']['aero_effective_sample_size']
                     metrics = region_metrics(predictions, reference)
                     metrics['exception'] = ''
                 except Exception as exc:
-                    ess = None
                     metrics = dict(error_m=None, covered=False, area_m2=None,
                                    cross_probability=None, prediction_y=None, prediction_z=None,
                                    time_error_s=None, exception=f'{type(exc).__name__}: {exc}')
                 rows.append(dict(shot=shot, scenario=scenario, method=method,
                                  t1=times[0], t2=times[1], truth_t=reference[0],
                                  truth_y=reference[1], truth_z=reference[2],
-                                 aerodynamic_ess=ess, **metrics))
+                                 **metrics))
             print(f'synthetic shot={shot+1}/{shots} scenario={scenario}', flush=True)
     summaries = []
     for scenario in scenarios:
-        for method in ['batch_laplace', 'ekf_mixture']:
+        for method in ['batch_laplace', 'ekf_9d']:
             group = [r for r in rows if r['scenario'] == scenario and r['method'] == method]
             valid = [r for r in group if r['error_m'] is not None]
             errors = [r['error_m'] for r in valid]
@@ -182,59 +172,31 @@ def run_benchmark(output, shots=12, draws=240, filters=512, seed=20261107):
         writer.writeheader()
         writer.writerows(rows)
     result = dict(seed=seed, shots_per_scenario=shots, posterior_draws=draws,
-                  ekf_filters=filters, observation_sd_m=.01,
+                  observation_sd_m=.01,
                   region='Empirical 95% covariance ellipse, conditional on crossing',
                   batch_approximation='MAP and inverse augmented-Jacobian Hessian; bounded Laplace draws',
-                  ekf_approximation='First-order state Gaussian; finite prior aerodynamic mixture',
+                  ekf_approximation='First-order state Gaussian in nine dimensions',
                   limitations=['Small fixed-design test, not proof of 95% calibration',
                                'Matched test theta sampled from stated plausible ranges, not full prior',
                                'All methods share each truth, timestamps, and noisy coordinates',
                                'Four scenarios share launch/noise seeds; scenario estimates are correlated',
                                'R0 and timestamps are exact; measurement noise applied once to r1/r2'],
-                  mismatch=dict(variable_cd='Cd(t)=Cd0*(1+0.6*t/0.4)',
+                  mismatch=dict(higher_drag='Cd(speed)=1.3*nominal Cd(speed)',
                                 crosswind='wind=(0,4,0) m/s',
-                                time_varying_b='b(t)=b0+B*(.22,-.18)*sin(2*pi*t/.4)'),
+                                fast_spin_decay='spin decay = 1.2 /s'),
                   excluded=rejected, summaries=summaries)
     (output / 'synthetic_summary.json').write_text(json.dumps(result, indent=2), encoding='utf-8')
     (output / 'synthetic_cases.json').write_text(json.dumps(generated, indent=2), encoding='utf-8')
     return result
 
 
-def ensemble_sensitivity(output):
-    """Audit the lowest-ESS benchmark case, without changing the benchmark."""
-    output = Path(output)
-    with (output / 'synthetic_per_shot.csv').open(encoding='utf-8') as f:
-        rows = list(csv.DictReader(f))
-    lowest = min((row for row in rows if row['aerodynamic_ess']),
-                 key=lambda row: float(row['aerodynamic_ess']))
-    cases = json.loads((output / 'synthetic_cases.json').read_text(encoding='utf-8'))
-    case = next(c for c in cases if str(c['shot']) == lowest['shot']
-                and c['scenario'] == lowest['scenario'])
-    results = []
-    for count in (128, 512, 1024):
-        prediction = ekf_predict(case['r0'], case['times'], case['observations'],
-                                 n_filters=count, draws=1200, seed=31072026)
-        results.append(dict(n_filters=count, draws=1200,
-                            ess=prediction['diagnostics']['aero_effective_sample_size'],
-                            **region_metrics(prediction['predictions'], case['reference'])))
-    audit = dict(shot=case['shot'], scenario=case['scenario'],
-                 seed=31072026, selection='Lowest aerodynamic ESS in 128-filter benchmark',
-                 results=results, caveat='One sensitivity case does not establish ensemble convergence.')
-    (output / 'ekf_ensemble_sensitivity.json').write_text(json.dumps(audit, indent=2), encoding='utf-8')
-    return audit
-
-
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--output', default=str(Path(__file__).parent / 'results'))
+    parser.add_argument('--output', type=Path, default=Path(__file__).parent / 'results')
     parser.add_argument('--shots', type=int, default=12)
-    parser.add_argument('--draws', type=int, default=240)
-    parser.add_argument('--filters', type=int, default=512)
+    parser.add_argument('--draws', type=int, default=4000)
     parser.add_argument('--seed', type=int, default=20261107)
-    parser.add_argument('--ensemble-check', action='store_true',
-                        help='Check the lowest-ESS case from existing results only.')
     args = parser.parse_args()
-    if args.ensemble_check:
-        print(json.dumps(ensemble_sensitivity(args.output), indent=2))
-    else:
-        run_benchmark(args.output, args.shots, args.draws, args.filters, args.seed)
+    if args.shots < 1 or args.draws < 20 or args.seed < 0:
+        parser.error('Require positive shots, at least 20 draws and nonnegative seed.')
+    run_benchmark(args.output, args.shots, args.draws, args.seed)

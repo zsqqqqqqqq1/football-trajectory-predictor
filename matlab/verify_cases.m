@@ -18,7 +18,7 @@ for j = 1:numel(cases)
         py = [c.python.tg,c.python.yg,c.python.zg];
         delta = abs(result-py);
         analytic = [NaN NaN NaN];
-        if c.cd==0 && norm(c.b)==0 && c.v0(1)>0
+        if c.use_fixed_cd && c.cd==0 && norm(c.omega0)==0 && c.v0(1)>0
             tt = (c.target_x-c.r0(1))/c.v0(1);
             analytic = [tt,c.r0(2)+c.v0(2)*tt,c.r0(3)+c.v0(3)*tt-0.5*c.constants.g*tt^2];
         end
@@ -77,10 +77,19 @@ function [status,result] = integrateCase(c,rel,ab)
     end
 end
 
-function dq=flightRhs(~,q,c)
+function dq=flightRhs(t,q,c)
     v=q(4:6); u=v-c.wind(:);
     factor=c.constants.rho*pi*c.constants.R^2/(2*c.constants.m);
-    acceleration=[0;0;-c.constants.g]+factor*norm(u)*(-c.cd*u+cross(c.b(:),u));
+    speed=norm(u);
+    cd=c.cd;
+    if ~c.use_fixed_cd
+        speeds=c.cd_nodes(1,:);
+        values=c.cd_nodes(2,:);
+        cd=interp1(speeds,values,max(speeds(1),min(speed,speeds(end))),'pchip');
+    end
+    omega=c.omega0(:)*exp(-c.constants.spin_decay*t);
+    magnus=8*pi*c.constants.rho*c.constants.R^3/(3*c.constants.m);
+    acceleration=[0;0;-c.constants.g]-factor*cd*speed*u+magnus*cross(omega,u);
     dq=[v;acceleration];
 end
 

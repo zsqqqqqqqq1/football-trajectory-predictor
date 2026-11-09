@@ -19,7 +19,7 @@ import xml.etree.ElementTree as ET
 
 import numpy as np
 
-from model import fit, propagate
+from model import drag_coefficient, fit, propagate
 from ekf import ekf_predict
 from validate import region_metrics
 
@@ -161,17 +161,17 @@ def score_case(by_n, start, line_sign, sigma_cm):
         try:
             if method == "gravity":
                 f = fit(r0, case["times"], obs, model="gravity", regularize=False)
-                e = propagate(f["theta"], r0, f["B"], target_x=case["target_x"])
+                e = propagate(f["theta"], r0, fixed_cd=f["fixed_cd"], target_x=case["target_x"])
                 point, cd = np.array([e["tg"], e["yg"], e["zg"]]), 0.0
                 cov, area, status = None, None, e["status"]
             elif method == "batch":
                 f = fit(r0, case["times"], obs, noise="gaussian", sigma=sigma)
-                e = propagate(f["theta"], r0, f["B"], target_x=case["target_x"])
-                point, cd = np.array([e["tg"], e["yg"], e["zg"]]), float(f["theta"][3])
+                e = propagate(f["theta"], r0, fixed_cd=f["fixed_cd"], target_x=case["target_x"])
+                point, cd = np.array([e["tg"], e["yg"], e["zg"]]), drag_coefficient(np.linalg.norm(f["theta"][:3]))
                 cov, area, status = None, None, e["status"]
             else:
-                res = ekf_predict(r0, case["times"], obs, noise_sd=sigma, n_filters=512,
-                                  draws=400, seed=31072026 + start, target_x=case["target_x"])
+                res = ekf_predict(r0, case["times"], obs, noise_sd=sigma,
+                                  draws=4000, seed=31072026 + start, target_x=case["target_x"])
                 m = region_metrics(res["predictions"], ref)
                 crossed = np.all(np.isfinite(res["predictions"]), axis=1)
                 point = res["predictions"][crossed].mean(axis=0) if crossed.any() else np.full(3, np.nan)
